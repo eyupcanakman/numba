@@ -167,7 +167,7 @@ class EntireIterator():
     Compute ptr along an entire array dimension.
     """
 
-    def __init__(self, context, builder, aryty, ary, dim, ary_int_ptr, extra_variations=None, extra_variation_arys=None, extra_int_ptr_offsets=None):
+    def __init__(self, context, builder, aryty, ary, dim, ary_int_ptr, extra_variations=None, extra_strides=None, extra_int_ptr_offsets=None):
         self.context = context
         self.builder = builder
         self.aryty = aryty
@@ -176,7 +176,7 @@ class EntireIterator():
         self.ll_intp = self.context.get_value_type(types.intp)
         self.ary_int_ptr = ary_int_ptr
         self.extra_variations = extra_variations if extra_variations else []
-        self.extra_variation_arys = extra_variation_arys if extra_variation_arys else []
+        self.extra_strides = extra_strides if extra_strides else []
         self.extra_int_ptr_offsets = extra_int_ptr_offsets if extra_int_ptr_offsets else []
 
     def prepare(self):
@@ -184,7 +184,7 @@ class EntireIterator():
         self.size = builder.extract_value(self.ary.shape, self.dim)
         self.dim_stride = builder.extract_value(self.ary.strides, self.dim)
         self.index = cgutils.alloca_once(builder, self.ll_intp)
-        self.extra_dim_strides = [builder.extract_value(tuple_additem(self.context, builder, self.extra_variation_arys[i].strides.type, self.extra_variation_arys[i].strides, Constant(self.ll_intp, self.dim), Constant(self.ll_intp, 0)), self.dim) for i in range(len(self.extra_variations))]
+        self.extra_dim_strides = [builder.extract_value(self.extra_strides[i], self.dim) for i in range(len(self.extra_variations))]
         self.bb_start = builder.append_basic_block()
         self.bb_end = builder.append_basic_block()
 
@@ -227,7 +227,7 @@ class EntireIterator():
 
 
 class ArrayIterator:
-    def __init__(self, context, builder, aryty, ary, extra_variations=None, extra_variation_arys=None):
+    def __init__(self, context, builder, aryty, ary, extra_variations=None, extra_strides=None):
         self.context = context
         self.builder = builder
         self.aryty = aryty
@@ -236,10 +236,10 @@ class ArrayIterator:
         zero = context.get_constant(types.intp, 0)
         self.int_ptr_offsets = cgutils.alloca_once_value(builder, zero)
         if extra_variations:
-            assert len(extra_variations) == len(extra_variation_arys)
             self.extra_int_ptr_offsets = [cgutils.alloca_once_value(builder, zero) for _ in extra_variations]
         else:
             self.extra_int_ptr_offsets = None
+        self.extra_strides = extra_strides
         self.indexers = [
             EntireIterator(
                 context, 
@@ -249,8 +249,8 @@ class ArrayIterator:
                 dim,
                 self.int_ptr_offsets,
                 extra_variations,
-                extra_variation_arys,
-                getattr(self, 'extra_int_ptr_offsets', None),
+                self.extra_strides,
+                self.extra_int_ptr_offsets,
             ) for dim in range(aryty.ndim)
         ]
 
@@ -355,7 +355,7 @@ def tuple_additem(context, builder, tuplety, tupleval, idx, val):
             val_i = builder.extract_value(tupleval, i)
             offptr = builder.gep(stack, [idx_i.type(0), idx_i], inbounds=True)
             builder.store(val_i, offptr)
-        with builder.if_then(builder.icmp_signed('>', idx_i, idx)):
+        with builder.if_then(builder.icmp_signed('>=', idx_i, idx)):
             val_i = builder.extract_value(tupleval, i)
             res_i = builder.add(idx_i, Constant(ll_intp, 1))
             offptr = builder.gep(stack, [res_i.type(0), res_i], inbounds=True)
@@ -424,17 +424,17 @@ def _numpy_sum_axis(typingctx, aryty, axisty, dtypety):
         ary = make_array(aryty)(context, builder, ary)
 
         from numba.np.arrayobj import _empty_nd_impl
-        ll_intp = context.get_value_type(types.intp)
 
         # Res shape will be a tuple one axis less than ndim and need appropriate shape calculations.
         res_shape = get_spliced_tuple(context, builder, ary.shape.type, ary.shape, axis)
         res = _empty_nd_impl(context, builder, sig.return_type, cgutils.unpack_tuple(builder, res_shape))
-
+        cgutils.memset(builder, res.data, builder.mul(res.itemsize,
+                                                      res.nitems), 0)
         # Create a variation tuple to indicate which dimensions are iterated over.
         var_tup = get_mask(context, builder, ary.shape.type.count, axis)
-
+        extra_res_strides = tuple_additem(context, builder, res.strides.type, res.strides, axis, Constant(context.get_value_type(types.intp), 0))
         # Loop on source and copy to destination
-        with ArrayIterator(context, builder, aryty, ary, (var_tup,), (res,)) as (offset, res_offset_tup):
+        with ArrayIterator(context, builder, aryty, ary, (var_tup,), (extra_res_strides,)) as (offset, res_offset_tup):
             res_offset = res_offset_tup[0]
             ary_iter_ptr = cgutils.pointer_add(builder, ary.data, offset)
             res_ptr = cgutils.pointer_add(builder, res.data, res_offset)
